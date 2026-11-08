@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShuttleDestiny</title>
+  <meta name="description" content="Choose your shuttle's destiny. Place the shuttle and both players on a singles court, and a machine learning model trained on 28,900 shots from 44 pro matches predicts the reply, right in your browser.">
+  <meta property="og:title" content="ShuttleDestiny">
+  <meta property="og:description" content="Choose your shuttle's destiny. Drag the shuttle and players on a singles court and see what a pro is most likely to hit next.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#predictor">ShuttleDestiny</a>
+    <nav aria-label="Sections">
+      <a href="#predictor">Predictor</a>
+      <a href="#accuracy">Accuracy</a>
+      <a href="#patterns">Pro patterns</a>
+      <a href="#about">About</a>
+      <a href="https://github.com/lambosurya/ShuttleSense-AI">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section id="predictor" class="band" aria-labelledby="predictor-title">
+      <div class="band-inner">
+        <div class="workspace">
+          <div class="intro">
+          <h1 id="predictor-title">What does the pro hit next?</h1>
+          <p class="lede">Choose your shuttle's destiny. Set up a moment in a singles rally, drag the shuttle and the players on the court, and a model trained on 28,900 shots from 44 professional singles matches predicts the reply.</p>
+          </div>
+
+          <figure class="court-wrap">
+            <svg id="court" class="court" viewBox="-3.6 -7.25 7.2 14.5" role="img" aria-labelledby="court-label">
+              <title id="court-label">Badminton court. Receiver's half at the top, hitter's half at the bottom.</title>
+              <g class="lines" aria-hidden="true"></g>
+              <g class="markers"></g>
+            </svg>
+            <figcaption class="court-legend">
+              <span><i class="key key-shuttle"></i>Where the shuttle lands</span>
+              <span><i class="key key-receiver"></i>Receiver</span>
+              <span><i class="key key-hitter"></i>Hitter</span>
+            </figcaption>
+            <p id="court-note" class="court-note"></p>
+          </figure>
+
+          <div class="panel">
+            <div class="results" aria-live="polite">
+              <p id="headline" class="result-headline">Loading the model…</p>
+              <p id="context" class="context"></p>
+              <ol id="bars" class="bars"></ol>
+              <p class="fineprint">Probabilities are the model's estimates from past pro matches, not certainties. The model runs entirely in your browser.</p>
+            </div>
+            <form id="setup" class="setup" autocomplete="off">
+              <label class="field field-wide">
+                <span>Shot just played</span>
+                <select id="shot"></select>
+              </label>
+              <label class="field">
+                <span>Shot before it</span>
+                <select id="prev"></select>
+              </label>
+              <label class="field">
+                <span>Two shots back</span>
+                <select id="prev2"></select>
+              </label>
+              <label class="field">
+                <span>Receiving player</span>
+                <select id="receiver"></select>
+              </label>
+              <label class="field">
+                <span>Shot number in rally</span>
+                <input id="round" type="number" min="1" max="60" value="4" inputmode="numeric">
+              </label>
+              <details class="more">
+                <summary>Contact and score</summary>
+                <div class="more-grid">
+                  <label class="check"><input id="high" type="checkbox" checked> Hit from above net height</label>
+                  <label class="check"><input id="backhand" type="checkbox"> Backhand</label>
+                  <label class="check"><input id="aroundhead" type="checkbox"> Around-the-head</label>
+                  <label class="field"><span>Hitter's score</span><input id="score-own" type="number" min="0" max="30" value="8"></label>
+                  <label class="field"><span>Receiver's score</span><input id="score-opp" type="number" min="0" max="30" value="8"></label>
+                </div>
+              </details>
+            </form>
+
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="accuracy" class="paper" aria-labelledby="accuracy-title">
+      <div class="paper-inner">
+        <h2 id="accuracy-title">How often it gets it right</h2>
+        <p class="section-lede">Each match was held out in turn and the model was tested only on matches it never saw during training, so these numbers reflect new matches, not memorised ones.</p>
+        <div class="split">
+          <div>
+            <h3>Exact next shot, out of 15 possible replies</h3>
+            <ul id="accuracy-bars" class="hbars"></ul>
+          </div>
+          <div class="callouts" id="callouts"></div>
+        </div>
+        <div class="split">
+          <div>
+            <h3>What the model relies on</h3>
+            <p class="note">How much accuracy drops when each input is scrambled.</p>
+            <ul id="importance-bars" class="hbars hbars-plain"></ul>
+          </div>
+          <div>
+            <h3>Easiest and hardest replies to predict</h3>
+            <p class="note">F1 score by reply type, where 1.0 would be perfect.</p>
+            <ul id="f1-bars" class="hbars hbars-plain"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="patterns" class="paper paper-alt" aria-labelledby="patterns-title">
+      <div class="paper-inner">
+        <h2 id="patterns-title">How the pros reply</h2>
+        <p class="section-lede">Straight from the 44 matches, before any model. Pick a shot to see what players hit back, or pick a player to see how their replies differ from everyone else's.</p>
+        <div class="split">
+          <div>
+            <label class="field field-inline"><span>After a</span><select id="pattern-shot"></select></label>
+            <ul id="follow-bars" class="hbars hbars-plain"></ul>
+          </div>
+          <div>
+            <label class="field field-inline"><span>Replies by</span><select id="pattern-player"></select></label>
+            <ul id="player-bars" class="hbars hbars-compare"></ul>
+            <p class="note legend-note"><span><i class="key key-receiver"></i>This player</span> <span><i class="key key-avg"></i>All players</span></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="about" class="paper" aria-labelledby="about-title">
+      <div class="paper-inner about">
+        <h2 id="about-title" class="about-title">About the project</h2>
+        <div class="split">
+          <div class="prose">
+            <p>ShuttleDestiny is a personal machine learning project by Surya Ilamurugu. It started as a Random Forest that looked at three things: the last shot, where it landed, and the shot number. That version scored <span data-metric="v1">43%</span>.</p>
+            <p>Version 2 adds real court positions for both players and the shuttle, converted from broadcast video into metres using each match's court mapping, plus the two earlier shots, the score and the receiving player. A gradient-boosted tree model learns from those inputs and reaches <span data-metric="v2">46%</span>, and it predicts rarer shots like rushes and wrist smashes far better than before.</p>
+            <p>The trained trees are exported to a small file and evaluated in JavaScript, so predictions are instant and no server is needed.</p>
+          </div>
+          <div class="prose">
+            <h3>Built with</h3>
+            <p>Python, pandas, scikit-learn (HistGradientBoostingClassifier), plain HTML, CSS and JavaScript.</p>
+            <h3>Data</h3>
+            <p>ShuttleSet by Wang et al. (KDD 2023): stroke-level annotations of professional men's and women's singles matches from 2018 to 2021.</p>
+            <p class="links"><a href="https://github.com/lambosurya/ShuttleSense-AI">Code on GitHub</a> <a href="https://github.com/wywyWang/CoachAI-Projects/tree/main/ShuttleSet">ShuttleSet dataset</a></p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p>ShuttleDestiny by Surya Ilamurugu</p>
+  </footer>
+
+  <script src="js/model.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

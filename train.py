@@ -1,118 +1,227 @@
-"""Train a badminton next-shot predictor using ShuttleSet CSV annotations."""
+"""Train the ShuttleDestiny next-shot model and export it for the website.
+
+Usage:  python train.py
+
+What it does
+1. Builds one example per shot from ShuttleSet (see features.py).
+2. Scores the model honestly with 5-fold cross-validation BY MATCH: the model
+   is always tested on matches it never saw during training.
+3. Compares it with a majority-class baseline and with the original
+   3-feature Random Forest that ShuttleDestiny v1 used.
+4. Trains the final model on all matches and writes:
+     shuttledestiny_model.joblib        -> used by predict.py
+     site/data/model.json        -> the same model, run in the browser
+     site/data/metrics.json      -> numbers shown on the website
+     site/data/analytics.json    -> shot statistics for the analytics page
+"""
+import json
+import time
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, log_loss,
+                             top_k_accuracy_score)
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-MODEL_FILE = ROOT / "shuttle_model.joblib"
+from features import (CATEGORICAL, CATEGORY_VOCAB, NUMERIC, ORIGINAL_FEATURES, ROOT, SEED, SHOTS,
+                      ShuttleDestinyModel, load_dataset)
 
-# ShuttleSet annotations sometimes use Chinese shot names.
-SHOT_NAMES = {
-    "放小球": "net shot", "擋小球": "return net", "殺球": "smash",
-    "點扣": "wrist smash", "挑球": "lob", "防守回挑": "defensive return lob",
-    "長球": "clear", "平球": "drive", "小平球": "driven flight",
-    "後場抽平球": "back-court drive", "切球": "drop",
-    "過渡切球": "passive drop", "推球": "push", "撲球": "rush",
-    "防守回抽": "defensive return drive", "勾球": "cross-court net shot",
-    "發短球": "short service", "發長球": "long service",
-}
-
-
-def shot_name(value):
-    text = str(value).strip().lower()
-    return SHOT_NAMES.get(text, text)
+SITE_DATA = ROOT / "site" / "data"
+MODEL_FILE = ROOT / "shuttledestiny_model.joblib"
+def original_model():
+    """ShuttleDestiny v1: Random Forest on shot type, landing area, shot number."""
+    return Pipeline([
+        ("preprocess", ColumnTransformer([
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), ["shot", "landing_area"]),
+            ("numeric", "passthrough", ["ball_round"]),
+        ])),
+        ("classifier", RandomForestClassifier(n_estimators=150, min_samples_leaf=5,
+                                              random_state=SEED, n_jobs=-1)),
+    ])
 
 
-def area_name(value):
-    text = str(value).strip()
-    return text[:-2] if text.endswith(".0") else text
+def scores(y, proba, classes):
+    pred = classes[proba.argmax(1)]
+    return {
+        "accuracy": accuracy_score(y, pred),
+        "macro_f1": f1_score(y, pred, average="macro"),
+        "top3": top_k_accuracy_score(y, proba, k=3, labels=classes),
+        "log_loss": log_loss(y, proba, labels=classes),
+    }
 
 
-def load_rallies():
-    examples = []
-    required = {"rally", "ball_round", "type", "landing_area"}
-    for csv_path in DATA_DIR.rglob("*.csv"):
-        try:
-            shots = pd.read_csv(csv_path, encoding="utf-8-sig", low_memory=False)
-        except (UnicodeError, pd.errors.ParserError) as error:
-            print(f"Skipping {csv_path.name}: {error}")
+def mean_scores(rows):
+    return {k: round(float(np.mean([r[k] for r in rows])), 4) for k in rows[0]} | {
+        "accuracy_std": round(float(np.std([r["accuracy"] for r in rows])), 4)}
+
+
+def cross_validate(data, players):
+    """5-fold cross-validation by match. Returns metrics and pooled predictions."""
+    folds = GroupKFold(n_splits=5)
+    new, new_any, old, base = [], [], [], []
+    y_all, pred_all = [], []
+    for k, (train_idx, test_idx) in enumerate(folds.split(data, groups=data["match"]), 1):
+        train, test = data.iloc[train_idx], data.iloc[test_idx]
+        y_test = test["next_shot"]
+
+        model = ShuttleDestinyModel(players).fit(train, train["next_shot"])
+        proba = model.predict_proba(test)
+        new.append(scores(y_test, proba, model.classes_))
+        new_any.append(scores(y_test, model.predict_proba(test.drop(columns="receiver_name")), model.classes_))
+        y_all.append(y_test.to_numpy())
+        pred_all.append(model.classes_[proba.argmax(1)])
+
+        v1 = original_model().fit(train[ORIGINAL_FEATURES], train["next_shot"])
+        old.append(scores(y_test, v1.predict_proba(test[ORIGINAL_FEATURES]), v1.classes_))
+
+        majority = train["next_shot"].mode()[0]
+        base.append({"accuracy": float((y_test == majority).mean())})
+        print(f"  fold {k}: {test['match'].nunique()} test matches | "
+              f"new {new[-1]['accuracy']:.1%} | v1 {old[-1]['accuracy']:.1%} | baseline {base[-1]['accuracy']:.1%}")
+
+    y_all, pred_all = np.concatenate(y_all), np.concatenate(pred_all)
+    replies = [s for s in SHOTS if s in set(y_all)]  # serves can never be a reply
+    per_shot = f1_score(y_all, pred_all, labels=replies, average=None, zero_division=0)
+    conf = confusion_matrix(y_all, pred_all, labels=replies)
+    return {
+        "new_known_player": mean_scores(new),
+        "new_any_player": mean_scores(new_any),
+        "v1_random_forest": mean_scores(old),
+        "baseline_accuracy": round(float(np.mean([b["accuracy"] for b in base])), 4),
+        "per_shot_f1": {s: round(float(f), 3) for s, f in zip(replies, per_shot)},
+        "confusion": {"labels": replies, "matrix": conf.tolist()},
+    }
+
+
+def feature_importance(data, players):
+    """How much accuracy drops when each input is scrambled (on held-out matches)."""
+    train_idx, test_idx = next(GroupKFold(n_splits=5).split(data, groups=data["match"]))
+    train, test = data.iloc[train_idx], data.iloc[test_idx]
+    model = ShuttleDestinyModel(players).fit(train, train["next_shot"])
+    y = test["next_shot"]
+    base = accuracy_score(y, model.classes_[model.predict_proba(test).argmax(1)])
+    groups = {
+        "Current shot type": ["shot"],
+        "Earlier shots (2 back)": ["prev_shot", "prev2_shot"],
+        "Landing spot": ["land_x", "land_y", "land_depth"],
+        "Receiver's position": ["receiver_x", "receiver_y", "receiver_to_land"],
+        "Hitter's position": ["hitter_x", "hitter_y"],
+        "Receiving player": ["receiver_name"],
+        "Contact (height, backhand)": ["hit_high", "backhand", "around_head"],
+        "Shot number & score": ["ball_round", "score_diff", "points_total"],
+    }
+    rng = np.random.default_rng(SEED)
+    result = {}
+    for label, cols in groups.items():
+        drops = []
+        for _ in range(3):
+            shuffled = test.copy()
+            order = rng.permutation(len(test))
+            for col in cols:
+                shuffled[col] = test[col].to_numpy()[order]
+            acc = accuracy_score(y, model.classes_[model.predict_proba(shuffled).argmax(1)])
+            drops.append(base - acc)
+        result[label] = round(float(np.mean(drops)), 4)
+    return dict(sorted(result.items(), key=lambda kv: -kv[1]))
+
+
+def export_for_browser(model):
+    """Write the boosted trees as compact JSON for site/js/model.js."""
+    clf = model.clf
+    trees = []
+    for iteration in clf._predictors:
+        for predictor in iteration:  # one tree per class
+            n = predictor.nodes
+            trees.append({
+                "f": n["feature_idx"].astype(int).tolist(),
+                "t": [float(v) for v in n["num_threshold"]],
+                "l": n["left"].astype(int).tolist(),
+                "r": n["right"].astype(int).tolist(),
+                "m": n["missing_go_to_left"].astype(int).tolist(),
+                "leaf": n["is_leaf"].astype(int).tolist(),
+                "v": [round(float(v), 6) for v in n["value"]],
+                "c": n["is_categorical"].astype(int).tolist(),
+                "b": n["bitset_idx"].astype(int).tolist(),
+                "bits": predictor.raw_left_cat_bitsets.astype(int).tolist(),
+            })
+    # scikit-learn re-encodes each categorical column to 0..n-1 using the
+    # values seen in training (unseen values become missing); the trees use
+    # those re-encoded codes, so the browser needs the same mapping.
+    encoder = clf._preprocessor.named_transformers_["encoder"]
+    category_maps = [[int(c) for c in cats if not np.isnan(c)] for cats in encoder.categories_]
+    return {
+        "version": 2,
+        "classes": clf.classes_.tolist(),
+        "columns": model.columns,
+        "categorical_count": len(CATEGORICAL) + 1,
+        "vocab": CATEGORY_VOCAB,
+        "players": model.players,
+        "category_maps": category_maps,
+        "baseline": [round(float(v), 6) for v in np.ravel(clf._baseline_prediction)],
+        "n_classes": len(clf.classes_),
+        "trees": trees,
+    }
+
+
+def analytics(data):
+    shot_counts = data["shot"].value_counts()
+    follow = pd.crosstab(data["shot"], data["next_shot"]).reindex(index=SHOTS, columns=SHOTS, fill_value=0)
+    by_player = {}
+    for name, rows in data.groupby("receiver_name"):
+        if len(rows) < 300:
             continue
-        if not required.issubset(shots.columns):
-            continue  # E.g., match.csv and homography.csv aren't shot tables.
-
-        shots = shots.dropna(subset=["rally", "ball_round", "type", "landing_area"]).copy()
-        shots["ball_round"] = pd.to_numeric(shots["ball_round"], errors="coerce")
-        shots = shots.dropna(subset=["ball_round"])
-        shots = shots.sort_values(["rally", "ball_round"])
-
-        # Each row describes a known shot; the label is the NEXT shot in its rally.
-        shots["next_shot"] = shots.groupby("rally")["type"].shift(-1)
-        shots = shots.dropna(subset=["next_shot"]).copy()
-        if shots.empty:
-            continue
-        shots["previous_shot"] = shots["type"].map(shot_name)
-        shots["landing_area"] = shots["landing_area"].map(area_name)
-        shots["next_shot"] = shots["next_shot"].map(shot_name)
-        # All sets within one source match belong to the same evaluation group.
-        shots["match_group"] = str(csv_path.parent.relative_to(DATA_DIR))
-        examples.append(shots[["previous_shot", "landing_area", "ball_round", "next_shot", "match_group"]])
-
-    if not examples:
-        raise SystemExit(
-            "No ShuttleSet stroke CSVs found. Download ShuttleSet and copy its set/ "
-            "directory into this project's data/ directory. See README.md."
-        )
-    dataset = pd.concat(examples, ignore_index=True)
-    if dataset["match_group"].nunique() < 2:
-        raise SystemExit("Need data from at least TWO match folders for a match-level train/test split.")
-    return dataset
+        share = rows["next_shot"].value_counts(normalize=True)
+        by_player[name] = {"replies": int(len(rows)),
+                           "mix": {s: round(float(share.get(s, 0)), 4) for s in SHOTS}}
+    rally = data.groupby(data["match"].astype(str))["ball_round"].max()
+    return {
+        "examples": int(len(data)),
+        "matches": int(data["match"].nunique()),
+        "players": int(pd.concat([data["receiver_name"], data["hitter_name"]]).nunique()),
+        "shot_counts": {s: int(shot_counts.get(s, 0)) for s in SHOTS},
+        "follow_matrix": {"labels": SHOTS, "matrix": follow.to_numpy().tolist()},
+        "by_player": by_player,
+        "longest_rally": int(data["ball_round"].max()),
+        "median_match_longest_rally": float(rally.median()),
+    }
 
 
 def main():
-    data = load_rallies()
-    feature_columns = ["previous_shot", "landing_area", "ball_round"]
-    features = data[feature_columns]
-    labels = data["next_shot"]
+    start = time.time()
+    data = load_dataset()
+    players = sorted(set(data["receiver_name"]) | set(data["hitter_name"]))
+    print(f"Examples: {len(data):,} shots from {data['match'].nunique()} matches, {len(players)} players")
 
-    # Split by MATCH, not by individual stroke: avoids testing on the same match.
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(features, labels, groups=data["match_group"]))
-    x_train, x_test = features.iloc[train_idx], features.iloc[test_idx]
-    y_train, y_test = labels.iloc[train_idx], labels.iloc[test_idx]
+    print("\nCross-validating (5 folds, split by match)...")
+    cv = cross_validate(data, players)
+    k, a, o = cv["new_known_player"], cv["new_any_player"], cv["v1_random_forest"]
+    print(f"\nMajority baseline     accuracy {cv['baseline_accuracy']:.1%}")
+    print(f"v1 Random Forest      accuracy {o['accuracy']:.1%}  macro-F1 {o['macro_f1']:.3f}  top-3 {o['top3']:.1%}")
+    print(f"v2 (any player)       accuracy {a['accuracy']:.1%}  macro-F1 {a['macro_f1']:.3f}  top-3 {a['top3']:.1%}")
+    print(f"v2 (player selected)  accuracy {k['accuracy']:.1%}  macro-F1 {k['macro_f1']:.3f}  top-3 {k['top3']:.1%}")
 
-    preprocess = ColumnTransformer([
-        ("categorical", OneHotEncoder(handle_unknown="ignore"), ["previous_shot", "landing_area"]),
-        ("numeric", "passthrough", ["ball_round"]),
-    ])
-    model = Pipeline([
-        ("preprocess", preprocess),
-        ("classifier", RandomForestClassifier(
-            n_estimators=150, min_samples_leaf=5, random_state=42, n_jobs=-1
-        )),
-    ])
-    model.fit(x_train, y_train)
-    predictions = model.predict(x_test)
+    print("\nMeasuring which inputs matter...")
+    importance = feature_importance(data, players)
+    for label, drop in importance.items():
+        print(f"  {label:28s} {-drop:+.1%}")
 
-    most_common = y_train.mode().iloc[0]
-    baseline = (y_test == most_common).mean()
-    print(f"Training examples: {len(x_train):,} | Test examples: {len(x_test):,}")
-    print(f"Training matches: {data.iloc[train_idx]['match_group'].nunique()}")
-    print(f"Test matches: {data.iloc[test_idx]['match_group'].nunique()}")
-    print(f"Majority-class baseline accuracy: {baseline:.1%} ({most_common})")
-    print(f"Model test accuracy: {accuracy_score(y_test, predictions):.1%}")
-    print("\nPer-shot performance:\n")
-    print(classification_report(y_test, predictions, zero_division=0))
+    print("\nTraining final model on all matches...")
+    final = ShuttleDestinyModel(players).fit(data, data["next_shot"])
+    joblib.dump(final, MODEL_FILE, compress=3)
 
-    joblib.dump(model, MODEL_FILE)
-    print(f"\nSaved trained model to: {MODEL_FILE}")
+    SITE_DATA.mkdir(parents=True, exist_ok=True)
+    (SITE_DATA / "model.json").write_text(json.dumps(export_for_browser(final), separators=(",", ":")))
+    metrics = cv | {"importance": importance, "trees": len(final.clf._predictors),
+                    "trained_on": {"shots": int(len(data)), "matches": int(data["match"].nunique())}}
+    (SITE_DATA / "metrics.json").write_text(json.dumps(metrics, indent=1))
+    (SITE_DATA / "analytics.json").write_text(json.dumps(analytics(data), separators=(",", ":")))
+    print(f"Saved {MODEL_FILE.name} and site/data/*.json in {time.time() - start:.0f}s")
 
 
 if __name__ == "__main__":
