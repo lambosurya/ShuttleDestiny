@@ -2,7 +2,7 @@
 
 **Choose your shuttle's destiny.** Place the shuttle and both players on a singles court, and a machine learning model trained on professional matches predicts the reply.
 
-Live site: **https://surya.ilamurugu.com**
+Live site: **https://shuttledestiny.com**
 
 ShuttleDestiny is a machine learning model trained on 28,922 shots from 44 professional singles matches (2018–2021). On the website you drag the shuttle and both players around a singles court, choose the shot that was just played, and the model predicts the reply instantly. The model runs entirely in your browser, so the site needs no server.
 
